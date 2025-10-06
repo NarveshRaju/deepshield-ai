@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+body {
+    background-color: #0D1117; /* Ensure body is dark */
+    color: #E6EDF3; /* Ensure default text is light */
+    font-family: 'Inter', sans-serif; /* You might want to import a font like Inter or Poppins */
+}
+
+/* Aurora Background - Adjusted for Dark Mode */
+.aurora-background {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 150%; /* Large enough to cover */
+  height: 150%;
+  background: 
+    radial-gradient(ellipse at 33% 40%, rgba(47, 129, 247, 0.08), transparent 70%), /* Much lower opacity */
+    radial-gradient(ellipse at 66% 60%, rgba(29, 78, 216, 0.08), transparent 70%); /* Much lower opacity */
+  animation: aurora 25s linear infinite; /* Slightly slower for subtlety */
+  z-index: 0;
+  opacity: 0.8; /* Overall opacity control */
+  filter: blur(80px); /* Add a strong blur for softness */
+}
+
+@keyframes aurora {
+  0% { transform: translate(-50%, -50%) rotate(0deg) scale(1); }
+  50% { transform: translate(-55%, -45%) rotate(180deg) scale(1.05); } /* Subtle movement */
+  100% { transform: translate(-50%, -50%) rotate(360deg) scale(1); }
+}
+
+/* Optional: Add a font import if you want Inter or Poppins */
+/* @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap'); */

@@ -1,185 +1,190 @@
 import os
-import google.generativeai as genai
+import cv2
+import tempfile
+import requests
+from io import BytesIO
+from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image
+from pytube import YouTube
+from mtcnn import MTCNN
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # -----------------------------
-# Environment Setup
+# Load environment variables
 # -----------------------------
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
 # -----------------------------
-# Configure Gemini API
+# Gemini API configuration
 # -----------------------------
-try:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not found in environment variables")
-    genai.configure(api_key=api_key)
-    print("✅ Gemini API configured successfully.")
-except Exception as e:
-    print(f"❌ CRITICAL ERROR: Gemini API configuration failed: {e}")
+api_key = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
 
-# ==============================================================================
-# NEW: MULTI-STEP CONVERSATIONAL ANALYSIS
-# This section replaces the old get_gemini_report function.
-# ==============================================================================
-
-def step1_technical_analysis(image_pil):
-    """
-    STEP 1: The Technician. Focus ONLY on the image pixels.
-    """
-    print("🧠 Step 1: Performing technical pixel analysis...")
-    prompt = """
-    You are a forensic imaging expert. Your task is to perform a strict, technical analysis of the provided image.
-    Focus ONLY on the visual data within the image itself.
-    
-    Analyze for:
-    - Lighting and shadow inconsistencies (e.g., multiple light sources that conflict).
-    - Unnatural edges or blurring around the subject.
-    - Texture artifacts on skin, clothing, or background that suggest digital manipulation.
-    - Reflection mismatches in eyes or shiny surfaces.
-    - Anatomical inconsistencies (e.g., strange proportions, weird hands).
-    
-    IMPORTANT: Do NOT perform a web search. Do NOT identify the person or the context. 
-    Your conclusion should be based solely on what you can see in the pixels.
-    
-    Provide your findings as a "Technical Summary".
-    """
+# -----------------------------
+# Face extraction utility for videos using MTCNN
+# -----------------------------
+def extract_faces_from_video(video_file, max_faces_per_video=50):
+    faces = []
     try:
-        # Using your preferred method for model initialization and content generation
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content([prompt, image_pil])
-        report = response.text.strip()
-        print("✅ Step 1 complete.")
-        return report
-    except Exception as e:
-        print(f"⚠️ Step 1 Error: {e}")
-        return f"Technical analysis failed: {e}"
+        detector = MTCNN()
+        cap = cv2.VideoCapture(video_file)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        interval = max(1, frame_count // max_faces_per_video)
+        count = 0
+        extracted = 0
 
-def step2_context_analysis(image_pil):
-    """
-    STEP 2: The Investigator. Focus ONLY on web context and origin.
-    """
-    print("🌐 Step 2: Performing web context and origin analysis...")
+        while cap.isOpened() and extracted < max_faces_per_video:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if count % interval == 0:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = detector.detect_faces(rgb_frame)
+                for d in detections:
+                    x, y, w, h = d['box']
+                    x, y = max(0, x), max(0, y)
+                    face = rgb_frame[y:y+h, x:x+w]
+                    if face.size == 0:
+                        continue
+                    faces.append(Image.fromarray(face))
+                    extracted += 1
+            count += 1
+        cap.release()
+        return faces
+    except Exception as e:
+        print(f"Face extraction error: {e}")
+        return []
+
+# -----------------------------
+# Gemini analysis steps
+# -----------------------------
+def step1_technical_analysis(images):
     prompt = """
-    You are an open-source intelligence (OSINT) analyst. Your task is to identify the context and origin of this image.
-    
-    1. Identify the person(s) and location if possible.
-    2. Perform the equivalent of a reverse image search to find where this image has appeared online (news articles, social media, etc.).
-    3. Summarize any public discussion, news, or controversy associated with this image. Specifically, check if it has ever been linked to a deepfake incident.
-    
-    Provide your findings as a "Context and Origin Summary".
-    """
-    try:
-        # Using your preferred method
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content([prompt, image_pil])
-        report = response.text.strip()
-        print("✅ Step 2 complete.")
-        return report
-    except Exception as e:
-        print(f"⚠️ Step 2 Error: {e}")
-        return f"Context analysis failed: {e}"
+    You are a forensic imaging expert. Analyze the following image(s) for evidence of manipulation.
+1. Examine pixel-level inconsistencies, edge artifacts, texture anomalies, reflections, lighting and shadow consistency.
+2. Examine temporal consistency across frames (if multiple images) for unnatural movements or unnatural facial microexpressions.
+3. Distinguish normal video compression artifacts, camera noise, and lighting effects from actual manipulations.
+4. For every finding, provide a proof or reason: e.g., "Detected edge mismatch around mouth (likely compression artifact)".
+5. Conclude ONLY if there is convincing evidence of deepfake. If no strong artifacts are found, explicitly state "No manipulation detected; video likely authentic."
 
-def step3_synthesis_and_final_report(technical_summary, context_summary):
     """
-    STEP 3: The Lead Analyst. Synthesize, check contradictions, and write the final report.
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    if not isinstance(images, list):
+        images = [images]
+    response = model.generate_content([prompt, *images])
+    return response.text.strip()
+
+def step2_context_analysis(images):
+    prompt = """
+You are an OSINT analyst. Only report confirmed publicly available information about the submitted media. 
+Do NOT infer or hallucinate events. 
+If the media is private or local, state: "No public information available for this file."
+
     """
-    print("✍️ Step 3: Synthesizing reports and checking for contradictions...")
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    if not isinstance(images, list):
+        images = [images]
+    response = model.generate_content([prompt, *images])
+    return response.text.strip()
+
+def step3_synthesis_and_final_report(tech_summary, context_summary):
     prompt = f"""
-    You are a lead forensic analyst writing a final, comprehensive report for a client.
-    You have received two reports from your team: a Technical Summary and a Context Summary.
-    Your job is to synthesize them into a single, clear, and easy-to-understand final report.
-
-    **CRUCIAL INSTRUCTION:** Your primary task is to identify and resolve any apparent contradictions between the two reports.
-    For example, if the Technical Summary finds the image pixels to be clean ("Likely Real"), but the Context Summary reveals the image is famous for being the SOURCE of a deepfake, you MUST address this. Explain the nuance clearly to the user. Do not just state both findings; explain how they fit together.
-
-    Structure your final output EXACTLY as follows:
-    1.  **Final Verdict:** A clear, concise verdict (e.g., "Authentic (Source of a Known Deepfake)", "Manipulated Image", "Authentic Image").
-    2.  **Confidence Level:** (Low/Medium/High/Very High).
-    3.  **Executive Summary:** A brief paragraph explaining the most important findings and resolving any contradictions.
-    4.  **Detailed Analysis:** A section combining the key points from both the technical and contextual reports.
-    5.  **Conclusion:** A final concluding paragraph.
-    6.  **Source Links:** Any relevant links found in the context analysis.
-
-    Here are the reports from your team:
-
-    ---
-    **[TECHNICAL SUMMARY]**
-    {technical_summary}
-    ---
-    **[CONTEXT AND ORIGIN SUMMARY]**
+    You are a lead forensic analyst writing a final report.
+    Resolve contradictions between technical and context findings.
+    
+    --- TECHNICAL SUMMARY ---
+    {tech_summary}
+    --- CONTEXT SUMMARY ---
     {context_summary}
-    ---
-
-    Now, generate the final, unified report for the client.
     """
-    try:
-        # This step is text-only, so the image is not needed.
-        # Using your preferred method.
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        final_report = response.text.strip()
-        print("✅ Step 3 complete. Final report generated.")
-        return final_report
-    except Exception as e:
-        print(f"⚠️ Step 3 Error: {e}")
-        return f"Final report synthesis failed: {e}"
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content(prompt)
+    return response.text.strip()
 
 # -----------------------------
-# Flask API Endpoint
+# Analyze endpoint
 # -----------------------------
 @app.route("/analyze", methods=["POST"])
 def analyze_media():
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"error": "Empty filename"}), 400
-
     try:
-        image_pil = Image.open(file.stream).convert("RGB")
-    except Exception as e:
-        return jsonify({"error": f"Invalid image: {e}"}), 400
+        input_data = None
 
-    try:
-        # --- RUN THE CONVERSATIONAL ANALYSIS CHAIN ---
-        tech_report = step1_technical_analysis(image_pil)
-        context_report = step2_context_analysis(image_pil)
-        final_report_text = step3_synthesis_and_final_report(tech_report, context_report)
+        # --- Case 1: File upload ---
+        if "file" in request.files:
+            file = request.files["file"]
+            filename = file.filename.lower()
+            if filename.endswith((".png", ".jpg", ".jpeg")):
+                input_data = Image.open(file.stream).convert("RGB")
+            elif filename.endswith((".mp4", ".mov", ".avi", ".mkv")):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    file.save(tmp.name)
+                    input_data = extract_faces_from_video(tmp.name)
+                    if not input_data:
+                        return jsonify({"error": "No faces detected in video"}), 400
+            else:
+                return jsonify({"error": "Unsupported file type"}), 400
 
-        # Heuristic for final verdict (now more reliable as it's based on the synthesized report)
-        report_lower = final_report_text.lower()
-        if "fake" in report_lower or "manipulated" in report_lower:
-            final_verdict = "Deepfake Detected"
-        elif "authentic" in report_lower or "real" in report_lower:
-            final_verdict = "Authentic Image"
+        # --- Case 2: URL input ---
+        elif request.is_json and "url" in request.json:
+            url = request.json["url"].strip()
+            if "youtube.com" in url or "youtu.be" in url:
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+                        yt = YouTube(url)
+                        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                        if not stream:
+                            return jsonify({"error": "No suitable YouTube stream found"}), 400
+                        stream.download(output_path=os.path.dirname(tmp_video.name), filename=os.path.basename(tmp_video.name))
+                        input_data = extract_faces_from_video(tmp_video.name)
+                        if not input_data:
+                            return jsonify({"error": "No faces detected in YouTube video"}), 400
+                except Exception as e:
+                    return jsonify({"error": f"Failed to process YouTube link: {e}"}), 500
+            else:
+                try:
+                    resp = requests.get(url, stream=True, timeout=15)
+                    if resp.status_code != 200:
+                        return jsonify({"error": "Failed to download image from URL"}), 400
+                    input_data = Image.open(BytesIO(resp.content)).convert("RGB")
+                except Exception as e:
+                    return jsonify({"error": f"Failed to download image from URL: {e}"}), 500
         else:
-            final_verdict = "Uncertain / Needs Review"
-        
-        # In the specific case of the "source" material, let's refine the verdict
-        if "source of" in report_lower and "deepfake" in report_lower:
-             final_verdict = "Authentic (Source of Deepfake)"
+            return jsonify({"error": "No file or URL provided"}), 400
 
-        # Return structured JSON
+        # --- Run analysis ---
+        tech_report = step1_technical_analysis(input_data)
+        context_report = step2_context_analysis(input_data)
+        final_report = step3_synthesis_and_final_report(tech_report, context_report)
+        verdict = "Uncertain / Needs Review"
+        lower_report = final_report.lower()
+        # --- Determine verdict ---
+        fake_hits = sum(word in lower_report for word in ["fake", "manipulated", "deepfake"])
+        auth_hits = sum(word in lower_report for word in ["authentic", "real", "genuine", "not fake", "not deepfake"])
+
+        if auth_hits > fake_hits:
+            verdict = "Authentic Image / Video"
+        elif fake_hits > auth_hits:
+            verdict = "Deepfake Detected"
+        else:
+            verdict = "Uncertain / Needs Review"
+
+
         return jsonify({
             "status": "success",
-            "final_verdict": final_verdict,
-            "gemini_report": final_report_text
+            "final_verdict": verdict,
+            "gemini_report": final_report
         })
 
     except Exception as e:
-        print(f"❌ Error during multi-step analysis: {e}")
+        print("Unexpected server error:", e)
         return jsonify({"error": str(e)}), 500
 
 # -----------------------------
-# Run Server
+# Run server
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
